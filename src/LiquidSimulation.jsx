@@ -10,6 +10,11 @@ import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js'
 
 export default function LiquidSimulation({
   particleCount = 8192 * 4,
+  particleSize = 1,
+  simWorldMin = new THREE.Vector3(-0.5, 0, -0.5),
+  simSize = 1,
+  localMin = new THREE.Vector3(0.015, 0.015, 0.015),
+  localMax = new THREE.Vector3(0.985, 0.985, 0.985),
   onParticleCountChange
 }) {
   const { gl: renderer, scene, camera, size } = useThree();
@@ -29,7 +34,7 @@ export default function LiquidSimulation({
     if (!renderer || !scene || !camera) return;
 
     // References to hold the simulation variables
-    let particleCountUniform, stiffnessUniform, restDensityUniform, dynamicViscosityUniform, dtUniform, gravityUniform, gridSizeUniform;
+    let particleCountUniform, stiffnessUniform, restDensityUniform, dynamicViscosityUniform, dtUniform, gravityUniform, gridSizeUniform, particleSizeUniform;
     let particleBuffer, cellBuffer, cellBufferFloat;
     let clearGridKernel, p2g1Kernel, p2g2Kernel, updateGridKernel, g2pKernel, workgroupKernel;
     let p2g1KernelWorkgroupBuffer, p2g2KernelWorkgroupBuffer, g2pKernelWorkgroupBuffer;
@@ -69,11 +74,12 @@ export default function LiquidSimulation({
     const setupUniforms = () => {
       gridSizeUniform = uniform(gridSize);
       particleCountUniform = uniform(particleCount, 'uint');
+      particleSizeUniform = uniform(particleSize);
       stiffnessUniform = uniform(50);
       restDensityUniform = uniform(1.5);
       dynamicViscosityUniform = uniform(0.1);
       dtUniform = uniform(1 / 60);
-      gravityUniform = uniform(new THREE.Vector3(0, -(9.81 * 9.81), 0));
+      gravityUniform = uniform(new THREE.Vector3(0, -(9.81 * 9.81) / simSize, 0));
       mouseRayOriginUniform = uniform(new THREE.Vector3(0, 0, 0));
       mouseRayDirectionUniform = uniform(new THREE.Vector3(0, 0, 0));
       mouseForceUniform = uniform(new THREE.Vector3(0, 0, 0));
@@ -84,7 +90,7 @@ export default function LiquidSimulation({
       const decodeFixedPoint = (i32) => float(i32).div(fixedPointMultiplier);
 
       const cellCount = gridSize.x * gridSize.y * gridSize.z;
-      
+
       clearGridKernel = Fn(() => {
         If(instanceIndex.greaterThanEqual(uint(cellCount)), () => {
           Return();
@@ -204,17 +210,8 @@ export default function LiquidSimulation({
         cellBufferFloat.element(instanceIndex).assign(vec4(vx, vy, vz, mass));
       })().compute(cellCount).setName('updateGridKernel');
 
-      const clampToRoundedBox = (pos, box, radius) => {
-        const result = pos.sub(0.5).toVar();
-        const pp = step(box, result.abs()).mul(result.add(box.negate().mul(result.sign())));
-        const ppLen = pp.length().toVar();
-        const dist = ppLen.sub(radius);
-        If(dist.greaterThan(0.0), () => {
-          result.subAssign(pp.normalize().mul(dist).mul(1.3));
-        });
-        result.addAssign(0.5);
-        return result;
-      };
+      const bMin = uniform(localMin);
+      const bMax = uniform(localMax);
 
       g2pKernel = Fn(() => {
         If(instanceIndex.greaterThanEqual(particleCountUniform), () => { Return(); });
@@ -261,11 +258,9 @@ export default function LiquidSimulation({
         particlePosition.addAssign(particleVelocity.mul(dtUniform));
         particlePosition.assign(clamp(particlePosition, vec3(1).div(gridSizeUniform), vec3(gridSize).sub(1).div(gridSizeUniform)));
 
-        const innerBox = gridSizeUniform.mul(0.5).sub(9.0).div(gridSizeUniform).toVar();
-        const innerRadius = float(6.0).div(gridSizeUniform.x);
         const posNext = particlePosition.add(particleVelocity.mul(dtUniform).mul(2.0)).toConst('posNext');
-        const posNextClamped = clampToRoundedBox(posNext, innerBox, innerRadius);
-        particleVelocity.addAssign(posNextClamped.sub(posNext));
+        const posNextClamped = clamp(posNext, bMin, bMax);
+        particleVelocity.addAssign(posNextClamped.sub(posNext).mul(1.5));
 
         particleVelocity.mulAssign(gridSizeUniform);
 
@@ -291,16 +286,20 @@ export default function LiquidSimulation({
     };
 
     const setupMesh = () => {
-      const geometry = BufferGeometryUtils.mergeVertices(new THREE.IcosahedronGeometry(0.008, 1).deleteAttribute('uv'));
+      const geometry = BufferGeometryUtils.mergeVertices(new THREE.IcosahedronGeometry(1.0, 1).deleteAttribute('uv'));
       const material = new THREE.MeshStandardNodeMaterial({ color: '#0066FF' });
+
+      const simSizeUniform = uniform(simSize);
+
       material.positionNode = Fn(() => {
         const particlePosition = particleBuffer.element(instanceIndex).get('position');
-        return attribute('position').add(particlePosition);
+        const physicalPos = particlePosition.mul(simSizeUniform);
+        return attribute('position').mul(particleSizeUniform).add(physicalPos);
       })();
 
       particleMesh = new THREE.Mesh(geometry, material);
       particleMesh.count = particleCount;
-      particleMesh.position.set(-0.5, 0, -0.5);
+      particleMesh.position.copy(simWorldMin);
       particleMesh.frustumCulled = false;
       scene.add(particleMesh);
       particleMeshRef.current = particleMesh;
@@ -326,6 +325,7 @@ export default function LiquidSimulation({
       mouseForceUniform,
       mouseRayOriginUniform,
       mouseRayDirectionUniform,
+      particleSizeUniform,
       mouseCoord: new THREE.Vector3(),
       prevMouseCoord: new THREE.Vector3(),
     };
@@ -337,7 +337,21 @@ export default function LiquidSimulation({
         particleMesh.material.dispose();
       }
     };
-  }, [renderer, scene, camera, particleCount]);
+  }, [renderer, scene, camera]);
+
+  useEffect(() => {
+    if (particlesData.current) {
+      if (particlesData.current.particleSizeUniform) {
+        particlesData.current.particleSizeUniform.value = particleSize;
+      }
+      if (particlesData.current.particleCountUniform) {
+        particlesData.current.particleCountUniform.value = particleCount;
+      }
+    }
+    if (particleMeshRef.current) {
+      particleMeshRef.current.count = particleCount;
+    }
+  }, [particleSize, particleCount]);
 
   // Handle Raycasting for interaction. 
   // We'll update pointer in a custom raycast plane logic since we intercept screen coords.
@@ -354,12 +368,13 @@ export default function LiquidSimulation({
       );
       const raycaster = new THREE.Raycaster();
       raycaster.setFromCamera(pointer, camera);
-      raycaster.ray.origin.x += 0.5;
-      raycaster.ray.origin.z += 0.5;
-      
-      data.mouseRayOriginUniform.value.copy(raycaster.ray.origin);
-      data.mouseRayDirectionUniform.value.copy(raycaster.ray.direction);
-      raycaster.ray.intersectPlane(raycastPlane, data.mouseCoord);
+
+      data.mouseRayOriginUniform.value.copy(raycaster.ray.origin).sub(simWorldMin).divideScalar(simSize);
+      data.mouseRayDirectionUniform.value.copy(raycaster.ray.direction).divideScalar(simSize);
+
+      if (raycaster.ray.intersectPlane(raycastPlane, data.mouseCoord)) {
+        data.mouseCoord.sub(simWorldMin).divideScalar(simSize);
+      }
     };
 
     window.addEventListener('pointermove', handlePointerMove);
