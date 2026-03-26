@@ -1,78 +1,26 @@
-/* ── Base Styles ───────────────────────────────────────────────────────────── */
+/* 🔥 Reset everything */
 * {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
-
-body,
-#root {
-  width: 100vw;
-  height: 100vh;
-  background-color: #0d0e12;
-  overflow: hidden;
-  font-family: 'Inter', -apple-system, sans-serif;
-  color: #fff;
-}
-
-.viewer-container {
-  width: 100%;
-  height: 100%;
-  position: relative;
-}
-
-.canvas-container {
-  width: 100%;
-  height: 100%;
-}
-
-/* ── UI Overlay ───────────────────────────────────────────────────────────── */
-.ui-overlay {
-  position: absolute;
-  top: 20px;
-  right: 20px;
-  z-index: 10;
-  width: 300px;
-  pointer-events: none;
-}
-
-.glass-panel {
-  background: rgba(26, 28, 35, 0.7);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 16px;
-  padding: 24px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-  pointer-events: auto;
-}
-
-h2 {
-  font-size: 1.1rem;
-  font-weight: 600;
-  margin-bottom: 8px;
-  letter-spacing: -0.01em;
-  color: #fff;
-}
-
-p {
-  font-size: 0.8rem;
-  color: #888;
-  margin-bottom: 20px;
-}
-
-.info-row {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 12px;
-  font-size: 0.75rem;
-  color: #888;
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
-  padding-top: 12px;
-}
-
-.info-val {
-  color: #fff;
-  font-family: 'JetBrains Mono', monospace;
-  font-weight: 500;
-}
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+  
+  /* 🔥 Make root fill screen */
+  html, body, #root {
+    width: 100%;
+    height: 100%;
+    overflow: hidden; /* 🚫 no scroll */
+    background: #ffffff; /* optional */
+  }
+  
+  /* 🔥 Canvas always full screen */
+  canvas {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+  }
+  .app {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+  }
