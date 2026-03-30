@@ -4,7 +4,8 @@ import * as THREE from 'three/webgpu';
 import {
   Fn, If, Return, instancedArray, instanceIndex, uniform, attribute,
   uint, float, clamp, struct, atomicStore, int, ivec3, array, vec3,
-  atomicAdd, Loop, atomicLoad, max, pow, mat3, vec4, cross, step, storage
+  atomicAdd, Loop, atomicLoad, max, pow, mat3, vec4, cross, step, storage,
+  dot, normalize
 } from 'three/tsl';
 import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
 
@@ -13,8 +14,8 @@ export default function LiquidSimulation({
   particleSize = 1,
   simWorldMin = new THREE.Vector3(-0.5, 0, -0.5),
   simSize = 1,
-  localMin = new THREE.Vector3(0.015, 0.015, 0.015),
-  localMax = new THREE.Vector3(0.985, 0.985, 0.985),
+  localBounds = [],
+  mouseForceEnabled = true,
   onParticleCountChange
 }) {
   const { gl: renderer, scene, camera, size } = useThree();
@@ -34,8 +35,8 @@ export default function LiquidSimulation({
     if (!renderer || !scene || !camera) return;
 
     // References to hold the simulation variables
-    let particleCountUniform, stiffnessUniform, restDensityUniform, dynamicViscosityUniform, dtUniform, gravityUniform, gridSizeUniform, particleSizeUniform;
-    let particleBuffer, cellBuffer, cellBufferFloat;
+    let particleCountUniform, stiffnessUniform, restDensityUniform, dynamicViscosityUniform, dtUniform, gravityUniform, gridSizeUniform, particleSizeUniform, boundsCountUniform;
+    let particleBuffer, cellBuffer, cellBufferFloat, boundsBuffer;
     let clearGridKernel, p2g1Kernel, p2g2Kernel, updateGridKernel, g2pKernel, workgroupKernel;
     let p2g1KernelWorkgroupBuffer, p2g2KernelWorkgroupBuffer, g2pKernelWorkgroupBuffer;
     let particleMesh;
@@ -52,9 +53,13 @@ export default function LiquidSimulation({
       const particleArray = new Float32Array(maxParticles * particleStructSize);
 
       for (let i = 0; i < maxParticles; i++) {
-        particleArray[i * particleStructSize] = (Math.random() * 0.8 + 0.1);
-        particleArray[i * particleStructSize + 1] = (Math.random() * 0.8 + 0.1);
-        particleArray[i * particleStructSize + 2] = (Math.random() * 0.8 + 0.1);
+        const box = localBounds[Math.floor(Math.random() * localBounds.length)] || {
+          min: new THREE.Vector3(0.1, 0.1, 0.1),
+          max: new THREE.Vector3(0.9, 0.9, 0.9)
+        };
+        particleArray[i * particleStructSize] = box.min.x + Math.random() * (box.max.x - box.min.x);
+        particleArray[i * particleStructSize + 1] = box.min.y + Math.random() * (box.max.y - box.min.y);
+        particleArray[i * particleStructSize + 2] = box.min.z + Math.random() * (box.max.z - box.min.z);
       }
 
       particleBuffer = instancedArray(particleArray, particleStruct);
@@ -69,6 +74,21 @@ export default function LiquidSimulation({
 
       cellBuffer = instancedArray(cellCount, cellStruct);
       cellBufferFloat = instancedArray(cellCount, 'vec4');
+
+      const boundsStruct = struct({
+        min: { type: 'vec3' },
+        max: { type: 'vec3' },
+      });
+      const boundsData = new Float32Array(localBounds.length * 8); // stride 8 for vec3 alignment
+      localBounds.forEach((b, i) => {
+        boundsData[i * 8] = b.min.x;
+        boundsData[i * 8 + 1] = b.min.y;
+        boundsData[i * 8 + 2] = b.min.z;
+        boundsData[i * 8 + 4] = b.max.x;
+        boundsData[i * 8 + 5] = b.max.y;
+        boundsData[i * 8 + 6] = b.max.z;
+      });
+      boundsBuffer = instancedArray(boundsData, boundsStruct);
     };
 
     const setupUniforms = () => {
@@ -83,6 +103,7 @@ export default function LiquidSimulation({
       mouseRayOriginUniform = uniform(new THREE.Vector3(0, 0, 0));
       mouseRayDirectionUniform = uniform(new THREE.Vector3(0, 0, 0));
       mouseForceUniform = uniform(new THREE.Vector3(0, 0, 0));
+      boundsCountUniform = uniform(localBounds.length, 'uint');
     };
 
     const setupComputeShaders = () => {
@@ -210,8 +231,7 @@ export default function LiquidSimulation({
         cellBufferFloat.element(instanceIndex).assign(vec4(vx, vy, vz, mass));
       })().compute(cellCount).setName('updateGridKernel');
 
-      const bMin = uniform(localMin);
-      const bMax = uniform(localMax);
+      // Clamping to multiple bounds handled in loop below
 
       g2pKernel = Fn(() => {
         If(instanceIndex.greaterThanEqual(particleCountUniform), () => { Return(); });
@@ -259,8 +279,44 @@ export default function LiquidSimulation({
         particlePosition.assign(clamp(particlePosition, vec3(1).div(gridSizeUniform), vec3(gridSize).sub(1).div(gridSizeUniform)));
 
         const posNext = particlePosition.add(particleVelocity.mul(dtUniform).mul(2.0)).toConst('posNext');
-        const posNextClamped = clamp(posNext, bMin, bMax);
-        particleVelocity.addAssign(posNextClamped.sub(posNext).mul(1.5));
+
+        const insideAny = float(0).toVar('insideAny');
+        const minDist = float(1e10).toVar('minDist');
+        const closestClamped = posNext.toVar('closestClamped');
+
+        Loop({ start: uint(0), end: boundsCountUniform, type: 'uint', name: 'i', condition: '<' }, ({ i }) => {
+          const b = boundsBuffer.element(i);
+          const bMin = b.get('min');
+          const bMax = b.get('max');
+
+          const isInside = step(bMin.x, posNext.x).mul(step(posNext.x, bMax.x))
+            .mul(step(bMin.y, posNext.y)).mul(step(posNext.y, bMax.y))
+            .mul(step(bMin.z, posNext.z)).mul(step(posNext.z, bMax.z));
+
+          If(isInside.greaterThan(0), () => {
+            insideAny.assign(1);
+          });
+
+          const clamped = clamp(posNext, bMin, bMax);
+          const d = clamped.sub(posNext).distance(0); // Using length of difference
+          const distToBox = clamped.sub(posNext).length();
+
+          If(distToBox.lessThan(minDist), () => {
+            minDist.assign(distToBox);
+            closestClamped.assign(clamped);
+          });
+        });
+
+        If(insideAny.equal(0), () => {
+          const normal = posNext.sub(closestClamped).normalize();
+          const vDotN = dot(particleVelocity, normal);
+          // If moving towards the boundary (away from the box), reflect the velocity
+          If(vDotN.greaterThan(0), () => {
+            particleVelocity.subAssign(normal.mul(vDotN.mul(1.5))); // 1.5 = bounce back with 50% extra impulse
+          });
+          // Synchronize position to exactly the boundary surface
+          particlePosition.assign(closestClamped);
+        });
 
         particleVelocity.mulAssign(gridSizeUniform);
 
@@ -337,7 +393,7 @@ export default function LiquidSimulation({
         particleMesh.material.dispose();
       }
     };
-  }, [renderer, scene, camera]);
+  }, [renderer, scene, camera, localBounds]);
 
   useEffect(() => {
     if (particlesData.current) {
@@ -389,10 +445,14 @@ export default function LiquidSimulation({
     const deltaTime = THREE.MathUtils.clamp(delta, 0.00001, 1 / 60);
     data.dtUniform.value = deltaTime;
 
-    data.mouseForceUniform.value.copy(data.mouseCoord).sub(data.prevMouseCoord).multiplyScalar(2);
-    const mouseForceLength = data.mouseForceUniform.value.length();
-    if (mouseForceLength > 0.3) {
-      data.mouseForceUniform.value.multiplyScalar(0.3 / mouseForceLength);
+    if (mouseForceEnabled) {
+      data.mouseForceUniform.value.copy(data.mouseCoord).sub(data.prevMouseCoord).multiplyScalar(2);
+      const mouseForceLength = data.mouseForceUniform.value.length();
+      if (mouseForceLength > 0.3) {
+        data.mouseForceUniform.value.multiplyScalar(0.3 / mouseForceLength);
+      }
+    } else {
+      data.mouseForceUniform.value.set(0, 0, 0);
     }
     data.prevMouseCoord.copy(data.mouseCoord);
 

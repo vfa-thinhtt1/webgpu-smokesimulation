@@ -5,9 +5,36 @@ import * as THREE from 'three/webgpu';
 import LiquidSimulation from './LiquidSimulation';
 
 
-function SceneContent({ pCount, pSize }) {
+function SceneContent({ pCount, pSize, mouseForceEnabled, doorVisible }) {
   const { scene } = useThree();
-  const { scene: gltfScene } = useGLTF('/VFA/VFA_Office_1_simplified.glb');
+  const { scene: gltfScene } = useGLTF('/VFA/room.glb');
+
+  useEffect(() => {
+    gltfScene.traverse((node) => {
+      if (node.isMesh) {
+        if (node.name.toLowerCase().includes('door')) {
+          node.visible = doorVisible;
+        }
+
+        // Transparency
+        const materials = Array.isArray(node.material) ? node.material : [node.material];
+        materials.forEach(mat => {
+          mat.transparent = true;
+          mat.opacity = 0;
+          mat.side = THREE.DoubleSide;
+          mat.depthWrite = false;
+        });
+
+        // Outline
+        if (!node.userData.hasOutline) {
+          const edges = new THREE.EdgesGeometry(node.geometry);
+          const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x000000 }));
+          node.add(line);
+          node.userData.hasOutline = true;
+        }
+      }
+    });
+  }, [gltfScene, doorVisible]);
 
   // Compute AABB and mapping info
   const boundsInfo = useMemo(() => {
@@ -18,27 +45,62 @@ function SceneContent({ pCount, pSize }) {
     // Cubic simulation size fits the max dimension of the box
     const simSize = Math.max(size.x, size.y, size.z);
 
-    // Sim covers [center - simSize/2, center + simSize/2]
-    const simWorldMin = new THREE.Vector3(
-      center.x - simSize / 2,
-      center.y - simSize / 2,
-      center.z - simSize / 2
-    );
+    // margin = pSize / 2
+    const margin = pSize / 2;
+    // Sim covers [box.min, box.min + simSize]
+    const simWorldMin = box.min.clone();
 
-    const localMin = new THREE.Vector3(
-      (box.min.x - simWorldMin.x) / simSize,
-      (box.min.y - simWorldMin.y) / simSize,
-      (box.min.z - simWorldMin.z) / simSize
-    );
+    const localBounds = [];
+    const sceneBox = new THREE.Box3().setFromObject(gltfScene);
 
-    const localMax = new THREE.Vector3(
-      (box.max.x - simWorldMin.x) / simSize,
-      (box.max.y - simWorldMin.y) / simSize,
-      (box.max.z - simWorldMin.z) / simSize
-    );
+    gltfScene.traverse((node) => {
+      if (node.isMesh) {
+        // Skip hidden doors from boundary calculation
+        if (!doorVisible && node.name.toLowerCase().includes('door')) return;
 
-    return { simWorldMin, simSize, localMin, localMax };
-  }, [gltfScene]);
+        const meshBox = new THREE.Box3().setFromObject(node);
+        if (!meshBox.isEmpty()) {
+
+
+          // Extend floor meshes to full room height
+          meshBox.min.y = sceneBox.min.y;
+          meshBox.max.y = sceneBox.max.y;
+
+          localBounds.push({
+            min: new THREE.Vector3(
+              (meshBox.min.x - simWorldMin.x) / simSize,
+              (meshBox.min.y - simWorldMin.y) / simSize,
+              (meshBox.min.z - simWorldMin.z) / simSize
+            ),
+            max: new THREE.Vector3(
+              (meshBox.max.x - simWorldMin.x - (4 * margin)) / simSize,
+              (meshBox.max.y - simWorldMin.y - (4 * margin)) / simSize,
+              (meshBox.max.z - simWorldMin.z - (4 * margin)) / simSize
+            )
+          });
+        }
+      }
+    });
+
+    // Fallback to entire scene if no meshes found
+    if (localBounds.length === 0) {
+      const fallbackBox = sceneBox.clone().expandByScalar(-margin);
+      localBounds.push({
+        min: new THREE.Vector3(
+          (fallbackBox.min.x - simWorldMin.x) / simSize,
+          (fallbackBox.min.y - simWorldMin.y) / simSize,
+          (fallbackBox.min.z - simWorldMin.z) / simSize
+        ),
+        max: new THREE.Vector3(
+          (fallbackBox.max.x - simWorldMin.x - (4 * margin)) / simSize,
+          (fallbackBox.max.y - simWorldMin.y - (4 * margin)) / simSize,
+          (fallbackBox.max.z - simWorldMin.z - (4 * margin)) / simSize
+        )
+      });
+    }
+
+    return { simWorldMin, simSize, localBounds };
+  }, [gltfScene, pSize, doorVisible]);
 
   useEffect(() => {
     import('three/addons/loaders/UltraHDRLoader.js').then(({ UltraHDRLoader }) => {
@@ -60,8 +122,8 @@ function SceneContent({ pCount, pSize }) {
         particleSize={pSize}
         simWorldMin={boundsInfo.simWorldMin}
         simSize={boundsInfo.simSize}
-        localMin={boundsInfo.localMin}
-        localMax={boundsInfo.localMax}
+        localBounds={boundsInfo.localBounds}
+        mouseForceEnabled={mouseForceEnabled}
       />
     </>
   );
@@ -72,14 +134,16 @@ export default function Scene() {
   const rootRef = useRef(null);
   const [hasWebGPU, setHasWebGPU] = useState(true);
   const [pCount, setPCount] = useState(8192 * 4);
-  const [pSize, setPSize] = useState(0.1);
+  const [pSize, setPSize] = useState(0.05);
+  const [mouseForceEnabled, setMouseForceEnabled] = useState(true);
+  const [doorVisible, setDoorVisible] = useState(true);
 
   // Update R3F root when controls change
   useEffect(() => {
     if (rootRef.current) {
-      rootRef.current.render(<SceneContent pCount={pCount} pSize={pSize} />);
+      rootRef.current.render(<SceneContent pCount={pCount} pSize={pSize} mouseForceEnabled={mouseForceEnabled} doorVisible={doorVisible} />);
     }
-  }, [pCount, pSize]);
+  }, [pCount, pSize, mouseForceEnabled, doorVisible]);
 
   useEffect(() => {
     let root;
@@ -119,7 +183,7 @@ export default function Scene() {
           events,
         });
 
-        root.render(<SceneContent pCount={pCount} pSize={pSize} />);
+        root.render(<SceneContent pCount={pCount} pSize={pSize} mouseForceEnabled={mouseForceEnabled} doorVisible={doorVisible} />);
 
         handleResize = () => {
           renderer.setSize(window.innerWidth, window.innerHeight);
@@ -151,6 +215,14 @@ export default function Scene() {
         <div style={{ display: 'flex', flexDirection: 'column' }}>
           <label style={{ fontSize: '14px', marginBottom: '8px', fontWeight: 'bold' }}>Particle Size: {pSize.toFixed(4)}</label>
           <input type="range" min={0.001} max={0.5} step={0.001} value={pSize} onChange={e => setPSize(Number(e.target.value))} />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <input type="checkbox" id="mouseForce" checked={mouseForceEnabled} onChange={e => setMouseForceEnabled(e.target.checked)} style={{ width: '18px', height: '18px', cursor: 'pointer' }} />
+          <label htmlFor="mouseForce" style={{ fontSize: '14px', fontWeight: 'bold', cursor: 'pointer' }}>Enable Mouse Force</label>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <input type="checkbox" id="doorToggle" checked={doorVisible} onChange={e => setDoorVisible(e.target.checked)} style={{ width: '18px', height: '18px', cursor: 'pointer' }} />
+          <label htmlFor="doorToggle" style={{ fontSize: '14px', fontWeight: 'bold', cursor: 'pointer' }}>Door Visible</label>
         </div>
       </div>
     </div>
